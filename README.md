@@ -9,7 +9,6 @@ Interactive Streamlit project to visualize Singapore weather/flood signals by su
 - Streamlit: **https://singapore-flood-risk.streamlit.app/**
 
 ## App Preview
-> Add your screenshot here: `assets/app-preview.png`
 
 ![Singapore Flood Risk App](assets/app-preview.png)
 
