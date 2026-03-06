@@ -1,24 +1,40 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
-import math
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pydeck as pdk
 import requests
-import pandas as pd
 import streamlit as st
+
+from floodlib.common import (
+    SG_TZ,
+    extract_coordinates,
+    extract_lat_lon,
+    floor_5min,
+    load_subzones,
+    map_point_to_subzone,
+    parse_api_key,
+    parse_timestamp as parse_ts,
+    to_float,
+)
+from floodlib.risk_model import (
+    average_or_none,
+    default_feature_row,
+    feature_fill_color,
+    predict_flood_risk,
+    risk_color,
+    risk_level,
+)
 
 BOUNDARY_PATH = Path("data/MasterPlan2019SubzoneBoundaryNoSeaGEOJSON.geojson")
 PROCESSED_FEATURES_PATH = Path("data/processed/subzone_weather_features.csv")
 ENV_PATH = Path(".env")
-
-SG_TZ = timezone(timedelta(hours=8))
 
 FEATURE_META: dict[str, dict[str, str]] = {
     "rainfall_mm_5min": {"label": "Rainfall (5 min, mm)", "fmt": "{:.2f}"},
@@ -33,57 +49,6 @@ FEATURE_META: dict[str, dict[str, str]] = {
     "forecast_rainy_fraction_2h": {"label": "2h Forecast Rainy Fraction", "fmt": "{:.2f}"},
     "forecast_thundery_fraction_2h": {"label": "2h Forecast Thundery Fraction", "fmt": "{:.2f}"},
 }
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def normalize(value: float, lower: float, upper: float) -> float:
-    if upper <= lower:
-        return 0.5
-    return clamp((value - lower) / (upper - lower), 0.0, 1.0)
-
-
-def parse_ts(value: str) -> datetime:
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=SG_TZ)
-    return dt.astimezone(SG_TZ)
-
-
-def floor_5min(dt: datetime) -> datetime:
-    return dt.replace(minute=(dt.minute // 5) * 5, second=0, microsecond=0)
-
-
-def to_float(value: str | int | float | None) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def default_feature_row() -> dict[str, float | None]:
-    return {
-        "rainfall_mm_5min": 0.0,
-        "rainfall_mm_15min": 0.0,
-        "rainfall_mm_30min": 0.0,
-        "rainfall_mm_60min": 0.0,
-        "air_temp_c": None,
-        "humidity_pct": None,
-        "lightning_count_5min": 0.0,
-        "lightning_count_sg_5min": 0.0,
-        "flood_alert_count_sg_5min": 0.0,
-        "forecast_rainy_fraction_2h": None,
-        "forecast_thundery_fraction_2h": None,
-    }
 
 
 @st.cache_data
@@ -118,152 +83,13 @@ def load_processed_table(path: Path) -> tuple[list[str], dict[str, dict[str, dic
     return sorted_ts, by_ts
 
 
-def extract_coords(geometry: dict[str, Any]) -> list[tuple[float, float]]:
-    points: list[tuple[float, float]] = []
-
-    def walk(node: Any) -> None:
-        if isinstance(node, list) and node:
-            if isinstance(node[0], (int, float)) and len(node) >= 2:
-                points.append((float(node[0]), float(node[1])))
-                return
-            for inner in node:
-                walk(inner)
-
-    walk(geometry.get("coordinates", []))
-    return points
-
-
-def point_in_ring(lon: float, lat: float, ring: list[list[float]]) -> bool:
-    inside = False
-    n = len(ring)
-    if n < 3:
-        return False
-    j = n - 1
-
-    for i in range(n):
-        xi, yi = float(ring[i][0]), float(ring[i][1])
-        xj, yj = float(ring[j][0]), float(ring[j][1])
-        intersects = ((yi > lat) != (yj > lat)) and (
-            lon < (xj - xi) * (lat - yi) / ((yj - yi) + 1e-12) + xi
-        )
-        if intersects:
-            inside = not inside
-        j = i
-    return inside
-
-
-def point_in_polygon(lon: float, lat: float, polygon_coords: list[Any]) -> bool:
-    if not polygon_coords:
-        return False
-    if not point_in_ring(lon, lat, polygon_coords[0]):
-        return False
-    for hole in polygon_coords[1:]:
-        if point_in_ring(lon, lat, hole):
-            return False
-    return True
-
-
-def geometry_contains_point(geometry: dict[str, Any], lon: float, lat: float) -> bool:
-    gtype = geometry.get("type")
-    coords = geometry.get("coordinates", [])
-    if gtype == "Polygon":
-        return point_in_polygon(lon, lat, coords)
-    if gtype == "MultiPolygon":
-        return any(point_in_polygon(lon, lat, poly) for poly in coords)
-    return False
-
-
 @st.cache_data
 def build_subzone_index(path: Path) -> list[dict[str, Any]]:
-    geojson = load_geojson(path)
-    out: list[dict[str, Any]] = []
-
-    for feature in geojson.get("features", []):
-        props = feature.get("properties", {})
-        geom = feature.get("geometry", {})
-
-        subzone = str(props.get("SUBZONE_N", "")).strip()
-        if not subzone:
-            continue
-
-        pts = extract_coords(geom)
-        if pts:
-            lons = [p[0] for p in pts]
-            lats = [p[1] for p in pts]
-            centroid_lon = sum(lons) / len(lons)
-            centroid_lat = sum(lats) / len(lats)
-            bbox = (min(lons), min(lats), max(lons), max(lats))
-        else:
-            centroid_lon, centroid_lat = 103.8198, 1.3521
-            bbox = (103.5, 1.2, 104.1, 1.5)
-
-        out.append(
-            {
-                "subzone": subzone,
-                "subzone_upper": subzone.upper(),
-                "planning_area": props.get("PLN_AREA_N"),
-                "region": props.get("REGION_N"),
-                "geometry": geom,
-                "bbox": bbox,
-                "centroid_lon": centroid_lon,
-                "centroid_lat": centroid_lat,
-            }
-        )
-
-    return out
+    return load_subzones(path)
 
 
-def map_point_to_subzone(lon: float, lat: float, subzones: list[dict[str, Any]]) -> str:
-    for sub in subzones:
-        min_lon, min_lat, max_lon, max_lat = sub["bbox"]
-        if not (min_lon <= lon <= max_lon and min_lat <= lat <= max_lat):
-            continue
-        if geometry_contains_point(sub["geometry"], lon, lat):
-            return str(sub["subzone_upper"])
-
-    best_name = ""
-    best_dist = float("inf")
-    for sub in subzones:
-        dx = lon - float(sub["centroid_lon"])
-        dy = lat - float(sub["centroid_lat"])
-        dist = dx * dx + dy * dy
-        if dist < best_dist:
-            best_dist = dist
-            best_name = str(sub["subzone_upper"])
-    return best_name
-
-
-def extract_lat_lon(value: Any) -> tuple[float | None, float | None]:
-    if isinstance(value, dict):
-        for lat_key, lon_key in (("latitude", "longitude"), ("lat", "lon"), ("lat", "lng")):
-            if lat_key in value and lon_key in value:
-                try:
-                    return float(value[lat_key]), float(value[lon_key])
-                except (TypeError, ValueError):
-                    pass
-        for inner in value.values():
-            lat, lon = extract_lat_lon(inner)
-            if lat is not None and lon is not None:
-                return lat, lon
-    elif isinstance(value, list):
-        for inner in value:
-            lat, lon = extract_lat_lon(inner)
-            if lat is not None and lon is not None:
-                return lat, lon
-    return None, None
-
-
-def parse_api_key(path: Path) -> str | None:
-    if not path.exists():
-        return None
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key.strip().lower() == "api-key" and value.strip():
-            return value.strip()
-    return None
+def map_point_to_subzone_upper(lon: float, lat: float, subzones: list[dict[str, Any]]) -> str:
+    return map_point_to_subzone(lon=lon, lat=lat, subzones=subzones).upper()
 
 
 def get_api_key() -> str | None:
@@ -286,45 +112,57 @@ def api_get_json(url: str, api_key: str) -> dict[str, Any]:
     return payload
 
 
-@st.cache_data(ttl=90)
-def fetch_live_snapshot(api_key: str, refresh_nonce: int) -> tuple[str, dict[str, dict[str, float | None]], str]:
-    _ = refresh_nonce
-    subzones = build_subzone_index(BOUNDARY_PATH)
-    snapshot: dict[str, dict[str, float | None]] = {s["subzone_upper"]: default_feature_row() for s in subzones}
+def latest_station_snapshot(
+    payload: dict[str, Any],
+    subzones: list[dict[str, Any]],
+) -> tuple[datetime | None, dict[str, float | None]]:
+    data = payload.get("data", {})
+    stations = {str(station.get("id", "")): station for station in data.get("stations", [])}
+    readings = data.get("readings", [])
+    if not readings:
+        return None, {}
 
-    # Use lists for averaging station-based features.
-    rain_values: dict[str, list[float]] = defaultdict(list)
-    temp_values: dict[str, list[float]] = defaultdict(list)
-    humidity_values: dict[str, list[float]] = defaultdict(list)
-    forecast_rainy: dict[str, list[float]] = defaultdict(list)
-    forecast_thundery: dict[str, list[float]] = defaultdict(list)
-    lightning_local: dict[str, float] = defaultdict(float)
+    latest = max(readings, key=lambda item: item.get("timestamp", ""))
+    ts_raw = latest.get("timestamp")
+    values_by_subzone: dict[str, list[float]] = defaultdict(list)
 
-    lightning_sg = 0.0
-    flood_sg = 0.0
-
-    timestamps: list[datetime] = []
-    notes: list[str] = []
-
-    # Rainfall / Air Temp / Humidity (station-based)
-    for url, value_key, sink in (
-        ("https://api-open.data.gov.sg/v2/real-time/api/rainfall", "rainfall_mm_5min", rain_values),
-        ("https://api-open.data.gov.sg/v2/real-time/api/air-temperature", "air_temp_c", temp_values),
-        ("https://api-open.data.gov.sg/v2/real-time/api/relative-humidity", "humidity_pct", humidity_values),
-    ):
-        payload = api_get_json(url, api_key)
-        data = payload.get("data", {})
-        stations = {str(s.get("id", "")): s for s in data.get("stations", [])}
-        readings = data.get("readings", [])
-        if not readings:
+    for measurement in latest.get("data", []):
+        station_id = str(measurement.get("stationId", ""))
+        value = to_float(measurement.get("value"))
+        station = stations.get(station_id, {})
+        location = station.get("location", {}) if isinstance(station, dict) else {}
+        lat = to_float(location.get("latitude"))
+        lon = to_float(location.get("longitude"))
+        if value is None or lat is None or lon is None:
             continue
+        subzone = map_point_to_subzone_upper(lon=lon, lat=lat, subzones=subzones)
+        if subzone:
+            values_by_subzone[subzone].append(value)
 
-        latest = max(readings, key=lambda x: x.get("timestamp", ""))
-        ts = latest.get("timestamp")
-        if ts:
-            timestamps.append(parse_ts(ts))
+    return (
+        parse_ts(ts_raw) if ts_raw else None,
+        {subzone: average_or_none(values) for subzone, values in values_by_subzone.items()},
+    )
 
-        for measurement in latest.get("data", []):
+
+def aggregate_live_rainfall(
+    payload: dict[str, Any],
+    subzones: list[dict[str, Any]],
+) -> tuple[datetime | None, dict[str, dict[str, float]]]:
+    data = payload.get("data", {})
+    stations = {str(station.get("id", "")): station for station in data.get("stations", [])}
+    readings = data.get("readings", [])
+    rainfall_by_subzone_ts: dict[tuple[str, str], list[float]] = defaultdict(list)
+    timestamps: set[datetime] = set()
+
+    for reading in readings:
+        ts_raw = reading.get("timestamp")
+        if not ts_raw:
+            continue
+        dt = floor_5min(parse_ts(ts_raw))
+        ts = dt.isoformat()
+        timestamps.add(dt)
+        for measurement in reading.get("data", []):
             station_id = str(measurement.get("stationId", ""))
             value = to_float(measurement.get("value"))
             station = stations.get(station_id, {})
@@ -333,24 +171,86 @@ def fetch_live_snapshot(api_key: str, refresh_nonce: int) -> tuple[str, dict[str
             lon = to_float(location.get("longitude"))
             if value is None or lat is None or lon is None:
                 continue
-            subzone = map_point_to_subzone(lon=lon, lat=lat, subzones=subzones)
+            subzone = map_point_to_subzone_upper(lon=lon, lat=lat, subzones=subzones)
             if subzone:
-                sink[subzone].append(value)
+                rainfall_by_subzone_ts[(subzone, ts)].append(value)
 
-    # 2h Forecast
+    latest_dt = max(timestamps) if timestamps else None
+    rainfall_windows = {
+        subzone["subzone_upper"]: {
+            "rainfall_mm_5min": 0.0,
+            "rainfall_mm_15min": 0.0,
+            "rainfall_mm_30min": 0.0,
+            "rainfall_mm_60min": 0.0,
+        }
+        for subzone in subzones
+    }
+    if latest_dt is None:
+        return None, rainfall_windows
+
+    window_points = {
+        "rainfall_mm_5min": 1,
+        "rainfall_mm_15min": 3,
+        "rainfall_mm_30min": 6,
+        "rainfall_mm_60min": 12,
+    }
+
+    for subzone in rainfall_windows:
+        for key, points in window_points.items():
+            total = 0.0
+            has_value = False
+            for step in range(points):
+                dt = latest_dt - timedelta(minutes=5 * step)
+                values = rainfall_by_subzone_ts.get((subzone, dt.isoformat()))
+                if not values:
+                    continue
+                total += sum(values) / len(values)
+                has_value = True
+            rainfall_windows[subzone][key] = round(total, 4) if has_value else 0.0
+
+    return latest_dt, rainfall_windows
+
+
+def fetch_live_snapshot(api_key: str) -> tuple[str, dict[str, dict[str, float | None]], str]:
+    subzones = build_subzone_index(BOUNDARY_PATH)
+    snapshot: dict[str, dict[str, float | None]] = {s["subzone_upper"]: default_feature_row() for s in subzones}
+    timestamps: list[datetime] = []
+    notes: list[str] = []
+
+    rainfall_payload = api_get_json("https://api-open.data.gov.sg/v2/real-time/api/rainfall", api_key)
+    rainfall_ts, rainfall_windows = aggregate_live_rainfall(rainfall_payload, subzones)
+    if rainfall_ts is not None:
+        timestamps.append(rainfall_ts)
+        notes.append("Live rainfall windows use the timestamps currently returned by the rainfall API.")
+    for subzone, windows in rainfall_windows.items():
+        snapshot[subzone].update(windows)
+
+    for url, value_key in (
+        ("https://api-open.data.gov.sg/v2/real-time/api/air-temperature", "air_temp_c"),
+        ("https://api-open.data.gov.sg/v2/real-time/api/relative-humidity", "humidity_pct"),
+    ):
+        payload = api_get_json(url, api_key)
+        ts, values = latest_station_snapshot(payload, subzones)
+        if ts is not None:
+            timestamps.append(ts)
+        for subzone, value in values.items():
+            snapshot[subzone][value_key] = value
+
     forecast_payload = api_get_json("https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast", api_key)
     forecast_data = forecast_payload.get("data", {})
-    area_meta = {str(a.get("name", "")): a for a in forecast_data.get("area_metadata", [])}
+    area_meta = {str(area.get("name", "")): area for area in forecast_data.get("area_metadata", [])}
     forecast_items = forecast_data.get("items", [])
     if forecast_items:
-        latest_item = max(forecast_items, key=lambda x: x.get("timestamp", ""))
+        latest_item = max(forecast_items, key=lambda item: item.get("timestamp", ""))
         ts = latest_item.get("timestamp")
         if ts:
             timestamps.append(parse_ts(ts))
 
-        for fcast in latest_item.get("forecasts", []):
-            area_name = str(fcast.get("area", "")).strip()
-            text = str(fcast.get("forecast", "")).lower()
+        forecast_rainy: dict[str, list[float]] = defaultdict(list)
+        forecast_thundery: dict[str, list[float]] = defaultdict(list)
+        for forecast in latest_item.get("forecasts", []):
+            area_name = str(forecast.get("area", "")).strip()
+            text = str(forecast.get("forecast", "")).lower()
             area = area_meta.get(area_name, {})
             label_location = area.get("label_location", {}) if isinstance(area, dict) else {}
             lat = to_float(label_location.get("latitude"))
@@ -358,29 +258,35 @@ def fetch_live_snapshot(api_key: str, refresh_nonce: int) -> tuple[str, dict[str
             if lat is None or lon is None:
                 continue
 
-            rainy = 1.0 if any(k in text for k in ("rain", "showers", "drizzle", "thunder")) else 0.0
-            thundery = 1.0 if "thunder" in text else 0.0
-            subzone = map_point_to_subzone(lon=lon, lat=lat, subzones=subzones)
-            if subzone:
-                forecast_rainy[subzone].append(rainy)
-                forecast_thundery[subzone].append(thundery)
+            subzone = map_point_to_subzone_upper(lon=lon, lat=lat, subzones=subzones)
+            if not subzone:
+                continue
+            forecast_rainy[subzone].append(
+                1.0 if any(token in text for token in ("rain", "showers", "drizzle", "thunder")) else 0.0
+            )
+            forecast_thundery[subzone].append(1.0 if "thunder" in text else 0.0)
 
-    # Flood alerts
+        for subzone in snapshot:
+            snapshot[subzone]["forecast_rainy_fraction_2h"] = average_or_none(forecast_rainy.get(subzone))
+            snapshot[subzone]["forecast_thundery_fraction_2h"] = average_or_none(forecast_thundery.get(subzone))
+
     flood_payload = api_get_json("https://api-open.data.gov.sg/v2/real-time/api/weather/flood-alerts", api_key)
     flood_records = flood_payload.get("data", {}).get("records", [])
+    flood_sg = 0.0
     if flood_records:
-        latest_record = max(flood_records, key=lambda x: x.get("datetime", ""))
+        latest_record = max(flood_records, key=lambda item: item.get("datetime", ""))
         ts = latest_record.get("datetime")
         if ts:
             timestamps.append(parse_ts(ts))
         readings = ((latest_record.get("item") or {}).get("readings") or [])
         flood_sg = float(len(readings))
 
-    # Lightning
     lightning_payload = api_get_json("https://api-open.data.gov.sg/v2/real-time/api/weather?api=lightning", api_key)
     lightning_records = lightning_payload.get("data", {}).get("records", [])
+    lightning_sg = 0.0
+    lightning_local: dict[str, float] = defaultdict(float)
     if lightning_records:
-        latest_record = max(lightning_records, key=lambda x: x.get("datetime", ""))
+        latest_record = max(lightning_records, key=lambda item: item.get("datetime", ""))
         ts = latest_record.get("datetime")
         if ts:
             timestamps.append(parse_ts(ts))
@@ -391,123 +297,17 @@ def fetch_live_snapshot(api_key: str, refresh_nonce: int) -> tuple[str, dict[str
             lat, lon = extract_lat_lon(reading)
             if lat is None or lon is None:
                 continue
-            subzone = map_point_to_subzone(lon=lon, lat=lat, subzones=subzones)
+            subzone = map_point_to_subzone_upper(lon=lon, lat=lat, subzones=subzones)
             if subzone:
                 lightning_local[subzone] += 1.0
 
-    for sub in subzones:
-        name = sub["subzone_upper"]
-        row = snapshot[name]
-
-        r5 = average_or_none(rain_values.get(name))
-        t = average_or_none(temp_values.get(name))
-        h = average_or_none(humidity_values.get(name))
-        fr = average_or_none(forecast_rainy.get(name))
-        ft = average_or_none(forecast_thundery.get(name))
-
-        row["rainfall_mm_5min"] = r5 if r5 is not None else 0.0
-        # No labeled historical model yet: estimate 1h context from latest intensity.
-        row["rainfall_mm_15min"] = (row["rainfall_mm_5min"] or 0.0) * 3.0
-        row["rainfall_mm_30min"] = (row["rainfall_mm_5min"] or 0.0) * 6.0
-        row["rainfall_mm_60min"] = (row["rainfall_mm_5min"] or 0.0) * 12.0
-
-        row["air_temp_c"] = t
-        row["humidity_pct"] = h
-        row["forecast_rainy_fraction_2h"] = fr
-        row["forecast_thundery_fraction_2h"] = ft
-
-        row["lightning_count_5min"] = lightning_local.get(name, 0.0)
-        row["lightning_count_sg_5min"] = lightning_sg
-        row["flood_alert_count_sg_5min"] = flood_sg
+    for subzone in snapshot:
+        snapshot[subzone]["lightning_count_5min"] = lightning_local.get(subzone, 0.0)
+        snapshot[subzone]["lightning_count_sg_5min"] = lightning_sg
+        snapshot[subzone]["flood_alert_count_sg_5min"] = flood_sg
 
     snapshot_ts = max(timestamps).isoformat() if timestamps else datetime.now(tz=SG_TZ).isoformat()
-    notes.append("Live mode estimates 15/30/60 min rainfall from latest 5-min reading (proxy).")
-
     return snapshot_ts, snapshot, " ".join(notes)
-
-
-def average_or_none(values: list[float] | None) -> float | None:
-    if not values:
-        return None
-    return sum(values) / len(values)
-
-
-def deterministic_noise(subzone_upper: str, timestamp: str) -> float:
-    payload = f"{subzone_upper}|{timestamp}".encode("utf-8")
-    digest = hashlib.md5(payload).hexdigest()
-    raw = int(digest[:8], 16)
-    return raw / 0xFFFFFFFF
-
-
-def predict_flood_risk(
-    row: dict[str, float | None],
-    subzone_upper: str,
-    timestamp: str,
-    w_r60: float,
-    w_r15: float,
-    w_humidity: float,
-    w_lightning: float,
-    w_forecast: float,
-    w_flood_now: float,
-    synthetic_factor: float,
-) -> float:
-    r60 = float(row.get("rainfall_mm_60min") or 0.0)
-    r15 = float(row.get("rainfall_mm_15min") or 0.0)
-    humidity = float(row.get("humidity_pct") or 70.0)
-    lightning_local = float(row.get("lightning_count_5min") or 0.0)
-    lightning_sg = float(row.get("lightning_count_sg_5min") or 0.0)
-    forecast_rain = float(row.get("forecast_rainy_fraction_2h") or 0.0)
-    flood_now = float(row.get("flood_alert_count_sg_5min") or 0.0)
-
-    rain_60_n = normalize(r60, 0.0, 80.0)
-    rain_15_n = normalize(r15, 0.0, 30.0)
-    humidity_n = normalize(humidity, 55.0, 100.0)
-    lightning_proxy = lightning_local if lightning_local > 0 else lightning_sg / 80.0
-    lightning_n = normalize(lightning_proxy, 0.0, 8.0)
-    forecast_n = normalize(forecast_rain, 0.0, 1.0)
-    flood_now_n = normalize(flood_now, 0.0, 4.0)
-
-    signal = (
-        w_r60 * rain_60_n
-        + w_r15 * rain_15_n
-        + w_humidity * humidity_n
-        + w_lightning * lightning_n
-        + w_forecast * forecast_n
-        + w_flood_now * flood_now_n
-    )
-
-    # Rule-based proxy model while flood labels are unavailable.
-    risk = 1.0 / (1.0 + math.exp(-3.5 * (signal - 0.55)))
-
-    if synthetic_factor > 0:
-        fake = deterministic_noise(subzone_upper=subzone_upper, timestamp=timestamp)
-        risk = (1.0 - synthetic_factor) * risk + synthetic_factor * fake
-
-    return clamp(risk, 0.0, 1.0)
-
-
-def risk_level(value: float) -> str:
-    if value >= 0.8:
-        return "Very High"
-    if value >= 0.6:
-        return "High"
-    if value >= 0.35:
-        return "Medium"
-    return "Low"
-
-
-def risk_color(value: float) -> list[int]:
-    v = clamp(value, 0.0, 1.0)
-    return [int(35 + 220 * v), int(170 - 140 * v), int(70 - 55 * v), 185]
-
-
-def feature_color(value: float) -> list[int]:
-    v = clamp(value, 0.0, 1.0)
-    # Blue -> cyan -> yellow -> red
-    red = int(30 + 225 * v)
-    green = int(80 + 130 * (1.0 - abs(v - 0.5) * 2.0))
-    blue = int(230 - 210 * v)
-    return [red, green, blue, 180]
 
 
 def fmt_value(value: float | None, fmt: str) -> str:
@@ -527,8 +327,8 @@ def percentile(values: list[float], q: float) -> float:
 def geojson_center(features: list[dict[str, Any]]) -> tuple[float, float]:
     lons: list[float] = []
     lats: list[float] = []
-    for f in features:
-        for lon, lat in extract_coords(f.get("geometry", {})):
+    for feature in features:
+        for lon, lat in extract_coordinates(feature.get("geometry", {})):
             lons.append(lon)
             lats.append(lat)
     if not lons or not lats:
@@ -628,19 +428,27 @@ def main() -> None:
 
         if "live_refresh_nonce" not in st.session_state:
             st.session_state.live_refresh_nonce = 0
+        if "live_snapshot_nonce" not in st.session_state:
+            st.session_state.live_snapshot_nonce = -1
+        if "live_snapshot_payload" not in st.session_state:
+            st.session_state.live_snapshot_payload = None
 
         with st.sidebar:
             if st.button("Refresh Live Data"):
                 st.session_state.live_refresh_nonce += 1
 
-        try:
-            selected_timestamp, snapshot_by_subzone, live_note = fetch_live_snapshot(
-                api_key=api_key,
-                refresh_nonce=int(st.session_state.live_refresh_nonce),
-            )
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Live API fetch failed: {exc}")
-            st.stop()
+        if (
+            st.session_state.live_snapshot_payload is None
+            or st.session_state.live_snapshot_nonce != st.session_state.live_refresh_nonce
+        ):
+            try:
+                st.session_state.live_snapshot_payload = fetch_live_snapshot(api_key=api_key)
+                st.session_state.live_snapshot_nonce = st.session_state.live_refresh_nonce
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Live API fetch failed: {exc}")
+                st.stop()
+
+        selected_timestamp, snapshot_by_subzone, live_note = st.session_state.live_snapshot_payload
 
     records: list[dict[str, Any]] = []
     raw_feature_values: list[float] = []
@@ -709,13 +517,10 @@ def main() -> None:
             value = rec["feature_value"]
             label = FEATURE_META[selected_feature]["label"]
             fmt = FEATURE_META[selected_feature]["fmt"]
-            value_num = float(value) if value is not None else 0.0
-            norm = normalize(value_num, vmin, vmax)
-            fill_color = feature_color(norm)
+            fill_color = feature_fill_color(value, vmin, vmax)
             value_text = fmt_value(value, fmt)
         else:
             label = "Combined Flood Risk"
-            value_num = risk
             fill_color = risk_color(risk)
             value_text = f"{risk * 100:.1f}%"
 

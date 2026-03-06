@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "singapore-flood"
+version = "0.1.0"
+description = "Singapore flood-risk visualization and feature pipeline."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.2,<3.0",
+  "pydeck>=0.9,<1.0",
+  "requests>=2.32,<3.0",
+  "streamlit>=1.44,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.14,<0.15",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120

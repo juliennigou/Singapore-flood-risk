@@ -1,6 +1,6 @@
 # Singapore Flood Risk Map
 
-Interactive Streamlit project to visualize Singapore weather/flood signals by subzone and estimate short-term flood risk using a rule-based proxy model (until annotated labels are available).
+Interactive Streamlit project to visualize Singapore weather and flood signals by subzone and estimate short-term flood risk with a transparent rule-based proxy while labeled flood outcomes are still limited.
 
 [![Streamlit](https://img.shields.io/badge/Streamlit-App-red?logo=streamlit)](https://singapore-flood-risk.streamlit.app/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](#quick-start)
@@ -47,6 +47,11 @@ This design is intentional so the UI/data pipeline can be production-ready while
 - Streamlit + PyDeck choropleth map.
 - Metrics/charts/tables under the map.
 
+## Repository Status
+- The repository includes a committed **boundary GeoJSON** and a **processed demo snapshot** so the app runs out of the box.
+- Secrets and raw exports are still ignored.
+- The canonical processed-feature builder is `scripts/build_dataset_from_datagov.py` or, if raw CSVs already exist locally, `scripts/build_processed_features_fast.py`.
+
 ## Quick Start
 ```bash
 # 1) Create environment
@@ -54,21 +59,39 @@ python -m venv .venv
 source .venv/bin/activate
 
 # 2) Install deps
-pip install streamlit pydeck pandas requests
+pip install -r requirements.txt
+
+# Optional: install project metadata + dev tooling
+pip install -e .[dev]
 
 # 3) Add your API key
 # .env -> api-key=...
 
-# 4) Add local boundary + feature files (not versioned)
-# data/MasterPlan2019SubzoneBoundaryNoSeaGEOJSON.geojson
-# data/processed/subzone_weather_features.csv
-
-# 5) Run app
+# 4) Run app
 streamlit run app.py
 ```
 
+## Data Pipeline
+```bash
+# Download raw weather/flood exports and rebuild the processed feature table
+python scripts/build_dataset_from_datagov.py \
+  --start-date 2026-03-01 \
+  --end-date 2026-03-05
+
+# Rebuild the processed feature table only, from existing raw CSV files
+python scripts/build_processed_features_fast.py \
+  --raw-dir data/raw \
+  --output data/processed/subzone_weather_features.csv
+```
+
+## Tests
+```bash
+ruff check .
+python -m unittest discover -s tests -v
+```
+
 ## Data Policy
-This repository is configured to **not commit datasets**.
+This repository ignores secrets and raw/large data artifacts by default.
 Ignored by default:
 - `data/raw/`
 - `data/raw_v2/`
@@ -87,8 +110,16 @@ Ignored by default:
 │   ├── build_dataset_from_datagov.py
 │   ├── build_processed_features_fast.py
 │   └── build_rainfall_history.py
+├── floodlib/
+│   ├── common.py
+│   ├── feature_pipeline.py
+│   └── risk_model.py
+├── tests/
+│   ├── test_feature_pipeline.py
+│   └── test_risk_model.py
 ├── data/
-│   └── .gitkeep
+│   ├── MasterPlan2019SubzoneBoundaryNoSeaGEOJSON.geojson
+│   └── processed/subzone_weather_features.csv
 └── assets/
     ├── .gitkeep
     └── app-preview.png   # add manually

@@ -3,9 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
+import sys
 import time
-from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +13,9 @@ import requests
 
 SG_TZ = timezone(timedelta(hours=8))
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 DATA_DIR = ROOT / "data"
 DEFAULT_RAW_DIR = DATA_DIR / "raw"
 DEFAULT_PROCESSED_DIR = DATA_DIR / "processed"
@@ -87,16 +89,9 @@ def parse_date(value: str) -> date:
 
 
 def load_api_key(env_path: Path) -> str:
-    if not env_path.exists():
-        raise FileNotFoundError(f"Missing env file: {env_path}")
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key.strip().lower() == "api-key" and value.strip():
-            return value.strip()
-    raise ValueError(f"No api-key found in {env_path}")
+    from floodlib.common import load_api_key as shared_load_api_key
+
+    return shared_load_api_key(env_path)
 
 
 def iter_days(start: date, end: date) -> list[date]:
@@ -413,311 +408,13 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> 
         writer.writeheader()
         writer.writerows(rows)
 
-
-def extract_coordinates(geometry: dict[str, Any]) -> list[tuple[float, float]]:
-    coords = geometry.get("coordinates", [])
-    points: list[tuple[float, float]] = []
-
-    def walk(node: Any) -> None:
-        if isinstance(node, list) and node:
-            if isinstance(node[0], (int, float)) and len(node) >= 2:
-                points.append((float(node[0]), float(node[1])))
-                return
-            for item in node:
-                walk(item)
-
-    walk(coords)
-    return points
-
-
-def point_in_ring(lon: float, lat: float, ring: list[list[float]]) -> bool:
-    inside = False
-    n = len(ring)
-    if n < 3:
-        return False
-    j = n - 1
-    for i in range(n):
-        xi, yi = float(ring[i][0]), float(ring[i][1])
-        xj, yj = float(ring[j][0]), float(ring[j][1])
-        cross = ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / ((yj - yi) + 1e-12) + xi)
-        if cross:
-            inside = not inside
-        j = i
-    return inside
-
-
-def point_in_polygon(lon: float, lat: float, polygon_coords: list[Any]) -> bool:
-    if not polygon_coords:
-        return False
-    if not point_in_ring(lon, lat, polygon_coords[0]):
-        return False
-    for hole in polygon_coords[1:]:
-        if point_in_ring(lon, lat, hole):
-            return False
-    return True
-
-
-def geometry_contains_point(geometry: dict[str, Any], lon: float, lat: float) -> bool:
-    gtype = geometry.get("type")
-    coords = geometry.get("coordinates", [])
-    if gtype == "Polygon":
-        return point_in_polygon(lon, lat, coords)
-    if gtype == "MultiPolygon":
-        return any(point_in_polygon(lon, lat, poly) for poly in coords)
-    return False
-
-
-def load_subzones(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    out: list[dict[str, Any]] = []
-    for feature in payload.get("features", []):
-        props = feature.get("properties") or {}
-        geometry = feature.get("geometry") or {}
-        name = str(props.get("SUBZONE_N", "")).strip()
-        if not name:
-            continue
-        points = extract_coordinates(geometry)
-        if points:
-            lon = sum(p[0] for p in points) / len(points)
-            lat = sum(p[1] for p in points) / len(points)
-        else:
-            lon, lat = 103.8198, 1.3521
-        out.append(
-            {
-                "subzone": name,
-                "planning_area": props.get("PLN_AREA_N"),
-                "region": props.get("REGION_N"),
-                "geometry": geometry,
-                "centroid_lon": lon,
-                "centroid_lat": lat,
-            }
-        )
-    return out
-
-
-def nearest_subzone(lon: float, lat: float, subzones: list[dict[str, Any]]) -> str:
-    best_name = ""
-    best_dist = float("inf")
-    for s in subzones:
-        dx = lon - float(s["centroid_lon"])
-        dy = lat - float(s["centroid_lat"])
-        dist = dx * dx + dy * dy
-        if dist < best_dist:
-            best_dist = dist
-            best_name = str(s["subzone"])
-    return best_name
-
-
-def map_point_to_subzone(lon: float, lat: float, subzones: list[dict[str, Any]]) -> str:
-    for s in subzones:
-        if geometry_contains_point(s["geometry"], lon, lat):
-            return str(s["subzone"])
-    return nearest_subzone(lon, lat, subzones)
-
-
-def load_station_to_subzone(subzones: list[dict[str, Any]], csv_paths: list[Path]) -> dict[str, str]:
-    coords: dict[str, tuple[float, float]] = {}
-    for path in csv_paths:
-        if not path.exists():
-            continue
-        with path.open("r", encoding="utf-8", newline="") as fp:
-            for row in csv.DictReader(fp):
-                sid = (row.get("station_id") or "").strip()
-                if not sid or sid in coords:
-                    continue
-                try:
-                    lat = float(row.get("latitude") or "nan")
-                    lon = float(row.get("longitude") or "nan")
-                except ValueError:
-                    continue
-                if math.isnan(lat) or math.isnan(lon):
-                    continue
-                coords[sid] = (lon, lat)
-
-    mapping: dict[str, str] = {}
-    for sid, (lon, lat) in coords.items():
-        mapping[sid] = map_point_to_subzone(lon=lon, lat=lat, subzones=subzones)
-    return mapping
-
-
-def read_numeric(value: str | None) -> float | None:
-    if value is None:
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
 def build_processed_table(raw_dir: Path, output_path: Path) -> None:
-    subzones = load_subzones(SUBZONE_GEOJSON)
-    if not subzones:
-        raise RuntimeError("No subzones found")
+    from floodlib.feature_pipeline import build_processed_table as build_canonical_processed_table
 
-    station_to_subzone = load_station_to_subzone(
-        subzones=subzones,
-        csv_paths=[raw_dir / "rainfall.csv", raw_dir / "air_temp.csv", raw_dir / "humidity.csv"],
-    )
-
-    rain_values: dict[tuple[str, str], list[float]] = defaultdict(list)
-    temp_values: dict[tuple[str, str], list[float]] = defaultdict(list)
-    hum_values: dict[tuple[str, str], list[float]] = defaultdict(list)
-    lightning_local: dict[tuple[str, str], int] = defaultdict(int)
-    lightning_global: dict[str, int] = defaultdict(int)
-    flood_global: dict[str, int] = defaultdict(int)
-    forecast_rainy: dict[str, list[int]] = defaultdict(list)
-    forecast_thundery: dict[str, list[int]] = defaultdict(list)
-    timestamps: set[datetime] = set()
-
-    def ingest_station(path: Path, value_col: str, target: dict[tuple[str, str], list[float]]) -> None:
-        if not path.exists():
-            return
-        with path.open("r", encoding="utf-8", newline="") as fp:
-            for row in csv.DictReader(fp):
-                ts_raw = row.get("timestamp")
-                sid = (row.get("station_id") or "").strip()
-                if not ts_raw or not sid:
-                    continue
-                val = read_numeric(row.get(value_col))
-                if val is None:
-                    continue
-                subzone = station_to_subzone.get(sid)
-                if not subzone:
-                    continue
-                dt = floor_5min(parse_timestamp(ts_raw))
-                ts = datetime_iso(dt)
-                timestamps.add(dt)
-                target[(subzone, ts)].append(val)
-
-    ingest_station(raw_dir / "rainfall.csv", "rainfall_mm", rain_values)
-    ingest_station(raw_dir / "air_temp.csv", "air_temp_c", temp_values)
-    ingest_station(raw_dir / "humidity.csv", "humidity_pct", hum_values)
-
-    for path, is_flood in ((raw_dir / "lightning.csv", False), (raw_dir / "flood_alerts.csv", True)):
-        if not path.exists():
-            continue
-        with path.open("r", encoding="utf-8", newline="") as fp:
-            for row in csv.DictReader(fp):
-                ts_raw = row.get("timestamp")
-                if not ts_raw:
-                    continue
-                dt = floor_5min(parse_timestamp(ts_raw))
-                ts = datetime_iso(dt)
-                timestamps.add(dt)
-                has_reading = int(row.get("has_reading") or 0)
-                if has_reading <= 0:
-                    continue
-                if is_flood:
-                    flood_global[ts] += 1
-                else:
-                    lightning_global[ts] += 1
-                    lat = read_numeric(row.get("latitude"))
-                    lon = read_numeric(row.get("longitude"))
-                    if lat is None or lon is None:
-                        continue
-                    subzone = map_point_to_subzone(lon=lon, lat=lat, subzones=subzones)
-                    lightning_local[(subzone, ts)] += 1
-
-    forecast_path = raw_dir / "forecast_2h.csv"
-    if forecast_path.exists():
-        with forecast_path.open("r", encoding="utf-8", newline="") as fp:
-            for row in csv.DictReader(fp):
-                ts_raw = row.get("timestamp")
-                if not ts_raw:
-                    continue
-                dt = floor_5min(parse_timestamp(ts_raw))
-                ts = datetime_iso(dt)
-                timestamps.add(dt)
-                text = (row.get("forecast") or "").lower()
-                forecast_rainy[ts].append(int(any(k in text for k in ("rain", "showers", "drizzle", "thunder"))))
-                forecast_thundery[ts].append(int("thunder" in text))
-
-    if not timestamps:
-        raise RuntimeError("No timestamps found in raw data")
-
-    min_ts = min(timestamps)
-    max_ts = max(timestamps)
-    grid: list[datetime] = []
-    cur = min_ts
-    while cur <= max_ts:
-        grid.append(cur)
-        cur += timedelta(minutes=5)
-
-    subzone_meta = {str(s["subzone"]): s for s in subzones}
-    subzone_names = sorted(subzone_meta.keys())
-
-    rows: list[dict[str, Any]] = []
-    idx_by_subzone: dict[str, list[int]] = defaultdict(list)
-
-    for subzone in subzone_names:
-        for dt in grid:
-            ts = datetime_iso(dt)
-            key = (subzone, ts)
-            rain = rain_values.get(key)
-            temp = temp_values.get(key)
-            hum = hum_values.get(key)
-            rain_frac = forecast_rainy.get(ts)
-            thunder_frac = forecast_thundery.get(ts)
-            row = {
-                "timestamp_5min": ts,
-                "subzone": subzone,
-                "planning_area": subzone_meta[subzone].get("planning_area"),
-                "region": subzone_meta[subzone].get("region"),
-                "rainfall_mm_5min": round(sum(rain) / len(rain), 4) if rain else 0.0,
-                "rainfall_mm_15min": 0.0,
-                "rainfall_mm_30min": 0.0,
-                "rainfall_mm_60min": 0.0,
-                "air_temp_c": round(sum(temp) / len(temp), 4) if temp else "",
-                "humidity_pct": round(sum(hum) / len(hum), 4) if hum else "",
-                "lightning_count_5min": lightning_local.get(key, 0),
-                "lightning_count_sg_5min": lightning_global.get(ts, 0),
-                "flood_alert_count_sg_5min": flood_global.get(ts, 0),
-                "forecast_rainy_fraction_2h": round(sum(rain_frac) / len(rain_frac), 4) if rain_frac else "",
-                "forecast_thundery_fraction_2h": (
-                    round(sum(thunder_frac) / len(thunder_frac), 4) if thunder_frac else ""
-                ),
-            }
-            rows.append(row)
-            idx_by_subzone[subzone].append(len(rows) - 1)
-
-    for _, indices in idx_by_subzone.items():
-        prefix: list[float] = [0.0]
-        for idx in indices:
-            prefix.append(prefix[-1] + float(rows[idx]["rainfall_mm_5min"]))
-
-        def wsum(i: int, points: int) -> float:
-            r = i + 1
-            l = max(0, r - points)
-            return prefix[r] - prefix[l]
-
-        for i, idx in enumerate(indices):
-            rows[idx]["rainfall_mm_15min"] = round(wsum(i, 3), 4)
-            rows[idx]["rainfall_mm_30min"] = round(wsum(i, 6), 4)
-            rows[idx]["rainfall_mm_60min"] = round(wsum(i, 12), 4)
-
-    write_csv(
-        output_path,
-        rows,
-        [
-            "timestamp_5min",
-            "subzone",
-            "planning_area",
-            "region",
-            "rainfall_mm_5min",
-            "rainfall_mm_15min",
-            "rainfall_mm_30min",
-            "rainfall_mm_60min",
-            "air_temp_c",
-            "humidity_pct",
-            "lightning_count_5min",
-            "lightning_count_sg_5min",
-            "flood_alert_count_sg_5min",
-            "forecast_rainy_fraction_2h",
-            "forecast_thundery_fraction_2h",
-        ],
+    build_canonical_processed_table(
+        raw_dir=raw_dir,
+        output_path=output_path,
+        subzone_geojson_path=SUBZONE_GEOJSON,
     )
 
 

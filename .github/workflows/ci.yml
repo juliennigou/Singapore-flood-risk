@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Compile Python files
+        run: |
+          python -m py_compile \
+            app.py \
+            scripts/build_dataset_from_datagov.py \
+            scripts/build_processed_features_fast.py \
+            scripts/build_rainfall_history.py \
+            floodlib/common.py \
+            floodlib/feature_pipeline.py \
+            floodlib/risk_model.py
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
