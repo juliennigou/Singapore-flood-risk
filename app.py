@@ -266,6 +266,16 @@ def parse_api_key(path: Path) -> str | None:
     return None
 
 
+def get_api_key() -> str | None:
+    try:
+        key = st.secrets.get("apikey")
+        if key:
+            return str(key)
+    except Exception:
+        pass
+    return parse_api_key(ENV_PATH)
+
+
 def api_get_json(url: str, api_key: str) -> dict[str, Any]:
     response = requests.get(url, headers={"X-Api-Key": api_key}, timeout=30)
     response.raise_for_status()
@@ -611,9 +621,9 @@ def main() -> None:
         }
 
     else:
-        api_key = parse_api_key(ENV_PATH)
+        api_key = get_api_key()
         if not api_key:
-            st.error("Live mode requires api-key in .env")
+            st.error("Live mode requires `apikey` in Streamlit secrets or `api-key` in local .env")
             st.stop()
 
         if "live_refresh_nonce" not in st.session_state:
