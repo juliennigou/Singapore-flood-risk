@@ -12,11 +12,14 @@ __pycache__/
 # Data (do not commit)
 data/raw/
 data/raw_v2/
-data/processed/
+data/processed/*
 data/*.csv
 data/*.geojson
 data/*.json
 data/*.parquet
+!data/MasterPlan2019SubzoneBoundaryNoSeaGEOJSON.geojson
+!data/processed/
+!data/processed/subzone_weather_features.csv
 
 # Optional local artifacts
 *.log

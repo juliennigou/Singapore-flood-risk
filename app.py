@@ -559,7 +559,7 @@ def main() -> None:
         planning_area = st.selectbox("Planning area", ["All", *planning_areas], index=0)
 
         st.header("Visualization")
-        viz_mode = st.radio("Layer", ["Single Feature", "Combined Flood Risk"], index=0)
+        viz_mode = st.radio("Layer", ["Single Feature", "Combined Flood Risk"], index=1)
 
         selected_feature = st.selectbox(
             "Feature",
@@ -576,7 +576,7 @@ def main() -> None:
         w_lightning = st.slider("Weight: Lightning", 0.0, 2.0, 0.7, 0.05)
         w_forecast = st.slider("Weight: Forecast Rain", 0.0, 2.0, 0.5, 0.05)
         w_flood_now = st.slider("Weight: Ongoing Flood Alerts", 0.0, 2.0, 1.0, 0.05)
-        synthetic_factor = st.slider("Synthetic/Fake Factor", 0.0, 0.6, 0.15, 0.01)
+        synthetic_factor = st.slider("Synthetic/Fake Factor", 0.0, 0.6, 0.4, 0.01)
 
     filtered = [
         f
