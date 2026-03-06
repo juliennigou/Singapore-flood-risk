@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+.mypy_cache/
+
+# OS
+.DS_Store
+
+# Data (do not commit)
+data/raw/
+data/raw_v2/
+data/processed/
+data/*.csv
+data/*.geojson
+data/*.json
+data/*.parquet
+
+# Optional local artifacts
+*.log
